@@ -110,6 +110,26 @@ involvement:
   resulting `.deb` is published as a repo release. Draft mode exists so an
   unattended build never ships to users untested — flip it on when iterating.
 
+### Email notification
+
+The `notify` job emails you every time a release is published. It needs five
+repo secrets (**Settings → Secrets and variables → Actions → New repository
+secret**); until `MAIL_TO` exists the job silently skips, so nothing breaks:
+
+| Secret | Example (Gmail) |
+|---|---|
+| `MAIL_SERVER` | `smtp.gmail.com` |
+| `MAIL_PORT` | `587` |
+| `MAIL_USERNAME` | `you@gmail.com` |
+| `MAIL_PASSWORD` | app password (Google Account → Security → 2-Step Verification → App passwords — not your login password) |
+| `MAIL_TO` | `you@example.com` (where the mail goes) |
+
+Any SMTP provider works — adjust server/port to match. Zero-setup
+alternative with no secrets: **Watch** this repo (Custom → Releases) and
+GitHub emails you about new releases itself; do the same on
+`FrSkyRC/ETHOS-Feedback-Community` if you also want FrSky-side news
+(including RCs the converter deliberately skips).
+
 ## Requirements
 
 - Debian 12+ / Ubuntu 22.04+ / Pop!_OS (or similar), **amd64**, with `sudo`.
