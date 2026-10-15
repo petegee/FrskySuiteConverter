@@ -16,6 +16,15 @@ Or point it at a file you already downloaded:
 ./frsky-port ~/Downloads/FrSky-Suite-Windows-2.0.1.exe --deb-rev 2 --no-install
 ```
 
+## After installing
+
+```sh
+sudo usermod -aG plugdev,dialout $USER   # then log out/in (or reboot)
+```
+
+Then reconnect the radio. If a step misbehaves, start with
+[`docs/troubleshooting.md`](docs/troubleshooting.md).
+
 ## What it does (13 steps)
 
 | # | Step | What happens |
@@ -90,15 +99,6 @@ Examples:
   make libudev-dev curl xz-utils file desktop-file-utils`.
   (Step 5's Node toolchain is a private tarball — your system node is never
   touched.)
-
-## After installing
-
-```sh
-sudo usermod -aG plugdev,dialout $USER   # then log out/in (or reboot)
-```
-
-Then reconnect the radio. If a step misbehaves, start with
-[`docs/troubleshooting.md`](docs/troubleshooting.md).
 
 ## Docs
 
