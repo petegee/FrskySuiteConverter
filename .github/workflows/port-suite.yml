@@ -150,27 +150,3 @@ jobs:
           Built from ${{ github.repository }}@${{ github.sha }} — see the README for method, scope and the use-at-your-own-risk disclaimer.
           Automated build: the step-12 verification gate passed, but no human has smoke-tested this .deb on a radio." \
             $DRAFT out/*.deb
-
-  notify:
-    needs: [discover, publish]
-    if: needs.discover.outputs.do_build == 'true' && secrets.MAIL_TO != ''
-    runs-on: ubuntu-latest
-    steps:
-      - uses: dawidd6/action-send-mail@v3
-        with:
-          server_address: ${{ secrets.MAIL_SERVER }}
-          server_port: ${{ secrets.MAIL_PORT }}
-          username: ${{ secrets.MAIL_USERNAME }}
-          password: ${{ secrets.MAIL_PASSWORD }}
-          subject: "frsky-port: ${{ needs.discover.outputs.our_tag }} published"
-          to: ${{ secrets.MAIL_TO }}
-          from: ${{ secrets.MAIL_USERNAME }}
-          body: |
-            The converter picked up upstream ${{ needs.discover.outputs.upstream_tag }}
-            and published ${{ needs.discover.outputs.our_tag }}:
-
-            https://github.com/${{ github.repository }}/releases/tag/${{ needs.discover.outputs.our_tag }}
-
-            Upstream asset sha256: ${{ needs.discover.outputs.asset_digest }}
-            Built from ${{ github.repository }}@${{ github.sha }}.
-            As always: automated build, step-12 gate passed, no human smoke test — see the README disclaimer.
