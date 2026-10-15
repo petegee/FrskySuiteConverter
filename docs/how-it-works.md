@@ -60,7 +60,9 @@ x86-64 ELFs).
    synchronous `sync` first: Suite stages flash images to the mounted disk
    ~1 s before the HID flash command and the radio reads them off the shared
    medium — without the flush the radio can see a torn file and NAK it
-   (`hid.flash.frsk.done status:255`).
+   (`hid.flash.frsk.done status:255`). Field-verified: X18RS bootloader
+   flash failed with `status:255` on the unflushed build and succeeded
+   with this flush.
 
 ## Runtime notes
 

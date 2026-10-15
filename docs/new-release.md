@@ -27,7 +27,9 @@ read the warnings — they exist for the cases automation can't judge.
    placeholder stays.
 6. **Full run + verify.** `./frsky-port <new-exe>` end to end; step 12 must
    pass clean. Then a real-radio smoke test: HID link, MSC disks, DFU detect
-   (`dfu-util -l`), and one flash flow with the debug log on.
+   (`dfu-util -l`), and one flash flow with the debug log on. If a flash
+   NAKs with `status:255`, follow the staged-image triage in
+   [`troubleshooting.md`](troubleshooting.md) before assuming a port bug.
 7. **Ship.** Bump `--deb-rev`, keep the previous `out/*.deb` files for
    rollback, note the upstream delta in your release notes.
 
