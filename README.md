@@ -37,15 +37,59 @@ Or point it at a file you already downloaded:
 Resume anywhere: `./frsky-port <input> --from-step 9` reuses earlier outputs
 (every step is idempotent). See `./frsky-port --help` for all flags.
 
+## Command reference
+
+```sh
+./frsky-port <URL-or-file> [options]
+```
+
+`<URL-or-file>` (required, exactly one): an `https://` URL to a
+`FrSky-Suite-Windows-*.exe` installer, or a local path to one. URLs are
+downloaded with `curl` (retries enabled); local files are copied. The sha256
+is always recorded to `work/upstream.exe.sha256`.
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--deb-rev N` | `1` | Debian revision: the `-N` in `frsky-suite_<upstream>-N_amd64.deb`. Bump when the *packaging* changes but upstream didn't, so `apt` sees an upgrade path. |
+| `--version X.Y.Z` | auto | Override the upstream version. By default it is read from the app's own `package.json` after extraction (authoritative); the input filename is only cross-checked with a warning. |
+| `--depends "..."` | tested line | Override the `DEBIAN/control` `Depends:` line. Needed if your distro renamed a library (e.g. Debian 12+/Ubuntu 24.04+ ship `libasound2t64` instead of `libasound2`). Quote the whole list. |
+| `--work DIR` | `./work` | Scratch + extracted trees (`upstream.exe`, `extracted-nsis/`, `app/`, `probe/`, `staging/`). Safe to delete; everything in it is regenerable. |
+| `--cache DIR` | `~/.cache/frsky-port` | Downloaded tools and reuse cache: static 7-Zip, Electron runtimes (one per version), private Node toolchain, native-module builds (keyed by `node-hid`+`drivelist` versions), dfu-util debs. Shared across ports — keep it. |
+| `--out DIR` | `./out` | Deliverable `.deb` directory. |
+| `--from-step N` | `1` | Start at step N (1–13), reusing earlier outputs. Missing prerequisites fail with a message naming the step to re-run from. |
+| `--to-step N` | `13` | Stop after step N. Combine with `--from-step` to iterate one stage, e.g. `--from-step 9 --to-step 9` after editing a patch. |
+| `--install` | — | Install with `sudo dpkg -i` without prompting. |
+| `--no-install` | — | Build only; never install. Implied when stdin is not a terminal. |
+| (neither flag) | prompt | Ask `Install <deb> now? [Y/n]` (default yes) after a successful build. |
+| `-h`, `--help` | — | Print the usage summary and exit. |
+
+Exit status is 0 on success (or on a declined install prompt), non-zero on
+the first failed step, with the failing step named in the error.
+
+Examples:
+
+```sh
+# Full port from URL, prompt before installing (the common case).
+./frsky-port https://www.frsky-rc.com/path/to/FrSky-Suite-Windows-2.0.1.exe
+
+# Re-issue the same upstream with a packaging fix, build only.
+./frsky-port ~/Downloads/FrSky-Suite-Windows-2.0.1.exe --deb-rev 2 --no-install
+
+# Iterate on the repack stage only, then verify through to a deb.
+./frsky-port ~/Downloads/FrSky-Suite-Windows-2.0.1.exe --from-step 9 --to-step 12 --no-install
+
+# Distro with renamed ALSA lib.
+./frsky-port <input> --depends "libusb-1.0-0, libudev1, ..., libasound2t64, ..."
+```
+
 ## Requirements
 
 - Debian 12+ / Ubuntu 22.04+ / Pop!_OS (or similar), **amd64**, with `sudo`.
 - Network access (upstream downloads + apt).
 - System packages are installed automatically: `binutils python3 gcc g++
   make libudev-dev curl xz-utils file desktop-file-utils`.
-
-`--work`, `--cache` and `--out` directories override the defaults
-(`./work`, `~/.cache/frsky-port`, `./out`).
+  (Step 5's Node toolchain is a private tarball — your system node is never
+  touched.)
 
 ## After installing
 
