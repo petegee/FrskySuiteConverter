@@ -109,6 +109,12 @@ jobs:
       - uses: actions/checkout@v4
       - run: chmod +x frsky-port
       - name: convert
+        # ELECTRON_DISABLE_SANDBOX: the stock runner cannot chown the
+        # SUID sandbox helper to root:4755, so Electron self-checks would
+        # abort (exit 133). This affects build-time checks only — the
+        # shipped desktop file + postinst handle the sandbox on user machines.
+        env:
+          ELECTRON_DISABLE_SANDBOX: 1
         run: >
           ./frsky-port "${{ needs.discover.outputs.asset_url }}"
           --expect-sha256 "${{ needs.discover.outputs.asset_digest }}"
