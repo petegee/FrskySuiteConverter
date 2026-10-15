@@ -60,6 +60,7 @@ is always recorded to `work/upstream.exe.sha256`.
 | Option | Default | Meaning |
 |---|---|---|
 | `--deb-rev N` | `1` | Debian revision: the `-N` in `frsky-suite_<upstream>-N_amd64.deb`. Bump when the *packaging* changes but upstream didn't, so `apt` sees an upgrade path. |
+| `--expect-sha256 H` | — | Refuse to continue unless the fetched `.exe` hashes to `H` (used by CI against the digest GitHub records on the upstream asset). |
 | `--version X.Y.Z` | auto | Override the upstream version. By default it is read from the app's own `package.json` after extraction (authoritative); the input filename is only cross-checked with a warning. |
 | `--depends "..."` | tested line | Override the `DEBIAN/control` `Depends:` line. Needed if your distro renamed a library (e.g. Debian 12+/Ubuntu 24.04+ ship `libasound2t64` instead of `libasound2`). Quote the whole list. |
 | `--work DIR` | `./work` | Scratch + extracted trees (`upstream.exe`, `extracted-nsis/`, `app/`, `probe/`, `staging/`). Safe to delete; everything in it is regenerable. |
@@ -90,6 +91,24 @@ Examples:
 # Distro with renamed ALSA lib.
 ./frsky-port <input> --depends "libusb-1.0-0, libudev1, ..., libasound2t64, ..."
 ```
+
+## Automation
+
+`.github/workflows/port-suite.yml` converts new Suite releases without human
+involvement:
+
+- **Daily schedule** polls `FrSkyRC/ETHOS-Feedback-Community` for the newest
+  *stable* `suite*` tag (prereleases and `rc`/`nightly`/`alpha`/`beta` tags
+  are skipped) and converts it if this repo has no matching
+  `suite-<upstream>-<deb-rev>` release yet.
+- **Manual dispatch** (`Actions → port-suite → Run workflow`) can target any
+  upstream tag (including RCs), set the deb revision, and create the release
+  as a **draft**.
+- The downloaded `.exe` is checked against the sha256 digest GitHub records
+  on the upstream asset (`--expect-sha256`) before converting; the build runs
+  on a stock `ubuntu-24.04` runner with the step-12 verification gate, and the
+  resulting `.deb` is published as a repo release. Draft mode exists so an
+  unattended build never ships to users untested — flip it on when iterating.
 
 ## Requirements
 

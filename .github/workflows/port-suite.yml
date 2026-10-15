@@ -1,0 +1,146 @@
+# port-suite — watch FrSky's Suite releases, convert, publish a .deb release.
+#
+# Trigger sources (in order):
+#   1. workflow_dispatch input `upstream_tag` (manual: rebuild anything,
+#      including RCs).
+#   2. Daily schedule: the newest *stable* `suite*` tag on
+#      FrSkyRC/ETHOS-Feedback-Community with no converted release here.
+#
+# Tag scheme for OUR releases:  suite-<upstream>-<deb-rev>  (e.g. suite-2.0.1-1)
+# Automatic runs skip prereleases and rc/nightly/alpha/beta tags; a manual
+# dispatch can target any tag (deliberate human action). DEB_REV bumps for
+# re-issues of the same upstream stay manual via the `deb_rev` input.
+#
+# The downloaded .exe is checked against the sha256 digest GitHub records on
+# the upstream asset before the converter runs (see --expect-sha256).
+name: port-suite
+
+on:
+  schedule:
+    - cron: "0 6 * * *"          # daily, 06:00 UTC
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: "Upstream tag to convert (default: newest unconverted stable)"
+        required: false
+        default: ""
+      deb_rev:
+        description: "Debian revision for our release tag"
+        required: false
+        default: "1"
+      draft:
+        description: "Create the release as a draft"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write               # create releases + upload assets
+
+concurrency:
+  group: port-suite
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: FrSkyRC/ETHOS-Feedback-Community
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    outputs:
+      do_build: ${{ steps.pick.outputs.do_build }}
+      upstream_tag: ${{ steps.pick.outputs.upstream_tag }}
+      upstream_version: ${{ steps.pick.outputs.upstream_version }}
+      asset_url: ${{ steps.pick.outputs.asset_url }}
+      asset_digest: ${{ steps.pick.outputs.asset_digest }}
+      our_tag: ${{ steps.pick.outputs.our_tag }}
+    steps:
+      - id: pick
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MANUAL_TAG: ${{ inputs.upstream_tag }}
+          DEB_REV: ${{ inputs.deb_rev }}
+        run: |
+          set -euo pipefail
+          [ -n "${DEB_REV:-}" ] || DEB_REV=1
+          if [ -n "$MANUAL_TAG" ]; then
+            TAG="$MANUAL_TAG"
+            echo "manual target: $TAG"
+          else
+            TAG=$(gh release list --repo "$UPSTREAM_REPO" --limit 30 \
+              --json tagName,isPrerelease \
+              --jq '[.[] | select(.isPrerelease == false) | .tagName]
+                    | map(select(test("^suite[0-9]"; "i")))
+                    | map(select((test("rc|nightly|alpha|beta"; "i")) | not))
+                    | .[0] // empty')
+            [ -n "$TAG" ] || { echo "do_build=false" >> "$GITHUB_OUTPUT"; echo "no stable suite tag found"; exit 0; }
+            echo "newest stable upstream: $TAG"
+          fi
+          VER=$(echo "$TAG" | sed -E 's/^[^0-9]*//')
+          [ -n "$VER" ] || { echo "cannot parse a version out of tag $TAG" >&2; exit 1; }
+          OUR_TAG="suite-$VER-$DEB_REV"
+          if gh release view "$OUR_TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "do_build=false" >> "$GITHUB_OUTPUT"
+            echo "$OUR_TAG already converted; nothing to do"
+            exit 0
+          fi
+          ASSET=$(gh release view "$TAG" --repo "$UPSTREAM_REPO" --json assets \
+            --jq '.assets[] | select(.name | test("Windows.*\\.exe$"; "i"))
+                  | "\(.url) \(.digest)"' | head -1)
+          [ -n "$ASSET" ] || { echo "no Windows .exe asset on $TAG" >&2; exit 1; }
+          URL=$(echo "$ASSET" | cut -d' ' -f1)
+          DIGEST=$(echo "$ASSET" | cut -d' ' -f2 | sed 's/^sha256://')
+          [ -n "$DIGEST" ] || { echo "upstream published no sha256 for $TAG" >&2; exit 1; }
+          {
+            echo "do_build=true"
+            echo "upstream_tag=$TAG"
+            echo "upstream_version=$VER"
+            echo "asset_url=$URL"
+            echo "asset_digest=$DIGEST"
+            echo "our_tag=$OUR_TAG"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: discover
+    if: needs.discover.outputs.do_build == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - run: chmod +x frsky-port
+      - name: convert
+        run: >
+          ./frsky-port "${{ needs.discover.outputs.asset_url }}"
+          --expect-sha256 "${{ needs.discover.outputs.asset_digest }}"
+          --deb-rev "${{ inputs.deb_rev || '1' }}"
+          --no-install
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deb
+          path: out/*.deb
+          if-no-files-found: error
+
+  publish:
+    needs: [discover, build]
+    if: needs.discover.outputs.do_build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: deb
+          path: out
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          DRAFT=""
+          [ "${{ inputs.draft }}" = "true" ] && DRAFT="--draft"
+          # shellcheck disable=SC2086
+          gh release create "${{ needs.discover.outputs.our_tag }}" \
+            --repo "${{ github.repository }}" \
+            --title "FrSky Suite ${{ needs.discover.outputs.upstream_version }} for Debian (port ${{ inputs.deb_rev || '1' }})" \
+            --notes "Community Linux port of FrSky Suite ${{ needs.discover.outputs.upstream_version }} (upstream tag \`${{ needs.discover.outputs.upstream_tag }}\`).
+          Upstream asset sha256 verified at build time: \`${{ needs.discover.outputs.asset_digest }}\`.
+          Built from ${{ github.repository }}@${{ github.sha }} — see the README for method, scope and the use-at-your-own-risk disclaimer.
+          Automated build: the step-12 verification gate passed, but no human has smoke-tested this .deb on a radio." \
+            $DRAFT out/*.deb

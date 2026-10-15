@@ -11,6 +11,9 @@
 #   --deb-rev N        Debian revision (default: 1) -> version "<upstream>-N"
 #   --version X.Y.Z    Override the upstream version (default: read from the
 #                      app's own package.json after extraction)
+#   --expect-sha256 H  Refuse to continue unless the fetched .exe matches
+#                      digest H (e.g. the sha256 GitHub records on the
+#                      upstream release asset)
 #   --depends "..."    Override the DEBIAN/control Depends line
 #   --work DIR         Scratch + extracted trees (default: ./work)
 #   --cache DIR        Downloaded tools, runtimes, native-module cache
@@ -49,6 +52,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 INPUT=""
 DEB_REV="1"
 VERSION_OVERRIDE=""
+EXPECT_SHA256=""
 DEPENDS_OVERRIDE=""
 WORK_DIR="$PWD/work"
 CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/frsky-port"
@@ -84,6 +88,7 @@ while [ $# -gt 0 ]; do
         -h|--help) usage; exit 0 ;;
         --deb-rev)     DEB_REV="$2"; shift 2 ;;
         --version)     VERSION_OVERRIDE="$2"; shift 2 ;;
+        --expect-sha256) EXPECT_SHA256="$2"; shift 2 ;;
         --depends)     DEPENDS_OVERRIDE="$2"; shift 2 ;;
         --work)        WORK_DIR="$2"; shift 2 ;;
         --cache)       CACHE_DIR="$2"; shift 2 ;;
@@ -214,6 +219,12 @@ step_1_fetch() {
             ;;
     esac
     ( cd "$WORK_DIR" && sha256sum upstream.exe | tee upstream.exe.sha256 )
+    if [ -n "$EXPECT_SHA256" ]; then
+        local actual; actual=$(sha256sum "$EXE" | cut -d' ' -f1)
+        [ "$actual" = "$EXPECT_SHA256" ] \
+            || die "sha256 mismatch: got $actual, want $EXPECT_SHA256"
+        log "fetch" "sha256 matches the expected digest"
+    fi
     local size; size=$(stat -c%s "$EXE")
     [ "$size" -gt 10000000 ] || die "input suspiciously small ($size bytes), not a Suite installer?"
     log "fetch" "input: $size bytes"
