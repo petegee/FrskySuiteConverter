@@ -122,9 +122,12 @@ Then reconnect the radio. If a step misbehaves, start with
 
 ## Disclaimer
 
-Use at your own risk. The author takes no responsibility for the upkeep of
-this repo, or for anything resulting from its use — including but not
-limited to failed or interrupted radio firmware/bootloader flashes, which
-can render a radio unusable. Always back up your radio and models in Suite
-before updating, verify checksums where available, and stop and ask (file an
-issue) if any step reports an error or warning you do not understand.
+Use at your own risk. The author makes no commitment to keeping this repo
+or the converter functioning — FrSky may change the Suite installer at any
+time, and fixes will land only on a best-effort basis, if at all. The author
+takes no responsibility for anything resulting from its use, including but
+not limited to failed or interrupted radio firmware/bootloader flashes,
+which can render a radio unusable. Always back up your radio and models in
+Suite before updating, verify checksums where available, and stop and ask
+(file an issue) if any step reports an error or warning you do not
+understand.
