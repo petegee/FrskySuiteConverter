@@ -119,3 +119,12 @@ Then reconnect the radio. If a step misbehaves, start with
   radio firmware remain property of FrSky RC.
 - Upstream behaviour is preserved: Aegis updater and audio transcode stay
   unsupported on Linux, exactly as upstream gates them on non-Windows.
+
+## Disclaimer
+
+Use at your own risk. The author takes no responsibility for the upkeep of
+this repo, or for anything resulting from its use — including but not
+limited to failed or interrupted radio firmware/bootloader flashes, which
+can render a radio unusable. Always back up your radio and models in Suite
+before updating, verify checksums where available, and stop and ask (file an
+issue) if any step reports an error or warning you do not understand.
