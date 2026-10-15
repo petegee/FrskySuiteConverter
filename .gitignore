@@ -1,0 +1,11 @@
+# Build outputs and caches (all regenerable; never commit).
+work/
+out/
+*.deb
+*.exe
+*.sha256
+
+# Editor / OS noise.
+.DS_Store
+*~
+*.swp

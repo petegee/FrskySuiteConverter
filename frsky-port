@@ -1,0 +1,759 @@
+#!/usr/bin/env bash
+# frsky-port — convert a FrSky Suite Windows (NSIS) installer into a Debian amd64 .deb.
+#
+# Usage:
+#   ./frsky-port <URL-or-file> [options]
+#
+#   <URL-or-file>  https URL of a FrSky-Suite-Windows-*.exe installer,
+#                  or a local path to one you already downloaded.
+#
+# Options:
+#   --deb-rev N        Debian revision (default: 1) -> version "<upstream>-N"
+#   --version X.Y.Z    Override the upstream version (default: read from the
+#                      app's own package.json after extraction)
+#   --depends "..."    Override the DEBIAN/control Depends line
+#   --work DIR         Scratch + extracted trees (default: ./work)
+#   --cache DIR        Downloaded tools, runtimes, native-module cache
+#                      (default: ~/.cache/frsky-port)
+#   --out DIR          Deliverable .deb directory (default: ./out)
+#   --from-step N      Start at step N (1-13), reusing earlier outputs
+#   --to-step N        Stop after step N (default: 13)
+#   --install          Install the .deb with sudo dpkg -i without prompting
+#   --no-install       Build only, never install
+#   -h, --help         This help
+#
+# Pipeline (each step is idempotent; resume with --from-step):
+#    1 fetch        download (or copy) the upstream .exe, record sha256
+#    2 extract-nsis unpack the NSIS installer ($PLUGINSDIR/app-64.7z)
+#    3 extract-app  unpack app-64.7z to the Windows application tree
+#    4 fingerprint  sanity checks + Electron version detection
+#    5 runtime      fetch exact Electron Linux runtime (SHA-verified) + a
+#                   private Node toolchain for the build steps
+#    6 probe        extract pristine app.asar; read versions, inventory, anchors
+#    7 natives      rebuild node-hid + drivelist for Linux (pinned, cached)
+#    8 dfuutil      fetch Ubuntu dfu-util .deb, extract the binary
+#    9 repack       asar-src + Linux patches -> repacked app.asar
+#   10 stage        assemble the Debian root tree
+#   11 deb          dpkg-deb --build
+#   12 verify       fail-closed checks (ELFs, load test, lint, contents)
+#   13 install      prompt, then sudo dpkg -i (skipped by --no-install)
+#
+# The repo ships only scripts, patches (embedded below) and docs. Every
+# FrSky/Electron/Node binary is downloaded at build time from its upstream
+# source and checksum-verified where upstream publishes checksums.
+set -euo pipefail
+
+PROG="$(basename "$0")"
+HERE="$(cd "$(dirname "$0")" && pwd)"
+
+INPUT=""
+DEB_REV="1"
+VERSION_OVERRIDE=""
+DEPENDS_OVERRIDE=""
+WORK_DIR="$PWD/work"
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/frsky-port"
+OUT_DIR="$PWD/out"
+FROM_STEP="1"
+TO_STEP="13"
+INSTALL_MODE="prompt"   # prompt | yes | no
+
+# ---------------------------------------------------------------- utilities
+
+die()  { echo "$PROG: error: $*" >&2; exit 1; }
+log()  { echo "[$PROG $1] $2" >&2; }   # stderr: command substitutions stay clean
+need_cmd() {
+    command -v "$1" >/dev/null 2>&1 || die "required command '$1' not found ($2)"
+}
+
+SUDO=""
+as_root() {
+    if [ "$(id -u)" -eq 0 ]; then "$@"; else ${SUDO:-sudo} "$@"; fi
+}
+
+usage() { sed -n '2,/^set -euo/p' "$0" | sed 's/^# \{0,1\}//'; }
+
+json_get() {
+    # json_get <file> <python-expr on loaded dict `d`> -- tiny JSON reader, no jq needed.
+    python3 -c "import json,sys; d=json.load(open('$1')); print($2)"
+}
+
+# ---------------------------------------------------------------- arguments
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -h|--help) usage; exit 0 ;;
+        --deb-rev)     DEB_REV="$2"; shift 2 ;;
+        --version)     VERSION_OVERRIDE="$2"; shift 2 ;;
+        --depends)     DEPENDS_OVERRIDE="$2"; shift 2 ;;
+        --work)        WORK_DIR="$2"; shift 2 ;;
+        --cache)       CACHE_DIR="$2"; shift 2 ;;
+        --out)         OUT_DIR="$2"; shift 2 ;;
+        --from-step)   FROM_STEP="$2"; shift 2 ;;
+        --to-step)     TO_STEP="$2"; shift 2 ;;
+        --install)     INSTALL_MODE="yes"; shift ;;
+        --no-install)  INSTALL_MODE="no"; shift ;;
+        --*) die "unknown option: $1 (see --help)" ;;
+        *)  [ -z "$INPUT" ] || die "only one input allowed"; INPUT="$1"; shift ;;
+    esac
+done
+[ -n "$INPUT" ] || { usage >&2; die "no input given"; }
+case "$FROM_STEP $TO_STEP" in
+    *[^0-9\ ]*|"") die "--from-step/--to-step must be numbers 1-13" ;;
+esac
+[ "$FROM_STEP" -ge 1 ] && [ "$TO_STEP" -le 13 ] && [ "$FROM_STEP" -le "$TO_STEP" ] \
+    || die "--from-step/--to-step must satisfy 1 <= from <= to <= 13"
+
+[ -t 0 ] || [ "$INSTALL_MODE" != "prompt" ] || INSTALL_MODE="no"  # non-tty: never prompt
+
+EXE="$WORK_DIR/upstream.exe"
+NSIS_DIR="$WORK_DIR/extracted-nsis"
+APP_DIR="$WORK_DIR/app"
+PROBE_DIR="$WORK_DIR/probe"
+ASARSRC=""   # set in step 9 (under staging)
+STAGE=""     # set in step 10 (under staging)
+
+run_step() { # run_step <n> <name-with-dashes>
+    if [ "$1" -ge "$FROM_STEP" ] && [ "$1" -le "$TO_STEP" ]; then
+        log "step" "$1/13 $2"
+        "step_$1_${2//-/_}"
+    else
+        log "skip" "$1/13 $2"
+    fi
+}
+
+resume_state() {
+    # Re-derive everything later steps need when starting past step 1.
+    [ "$FROM_STEP" -le 1 ] && return 0
+    [ -f "$EXE" ] || die "--from-step $FROM_STEP needs $EXE; start from step 1"
+    if [ "$FROM_STEP" -gt 3 ]; then
+        [ -d "$APP_DIR/resources" ] || die "no extracted app tree; re-run from step 2"
+        local exe_bin; exe_bin=$(ls "$APP_DIR/"*.exe | grep -iv uninstall | head -1)
+        ELECTRON_VER=$(strings "$exe_bin" | grep -o "Electron/[0-9.]*" | head -1 | cut -d/ -f2)
+        [ -n "$ELECTRON_VER" ] || die "cannot re-detect Electron version; re-run from step 4"
+    fi
+    if [ "$FROM_STEP" -gt 5 ]; then
+        ELECTRON_DIST="$CACHE_DIR/electron-$ELECTRON_VER/dist"
+        [ -x "$ELECTRON_DIST/electron" ] || die "no cached Electron runtime; re-run from step 5"
+        export PATH="$CACHE_DIR/node/bin:$PATH"
+        command -v node >/dev/null 2>&1 || die "no cached node toolchain; re-run from step 5"
+    fi
+    if [ "$FROM_STEP" -gt 6 ]; then
+        [ -f "$PROBE_DIR/package.json" ] || die "no probe tree; re-run from step 6"
+        UPSTREAM_VER=$(json_get "$PROBE_DIR/package.json" "d.get('version')")
+        [ -n "$VERSION_OVERRIDE" ] && UPSTREAM_VER="$VERSION_OVERRIDE"
+        HID_VER=$(json_get "$PROBE_DIR/node_modules/node-hid/package.json" "d.get('version')")
+        DRIVELIST_VER=$(json_get "$PROBE_DIR/node_modules/drivelist/package.json" "d.get('version')")
+    fi
+    if [ "$FROM_STEP" -gt 7 ]; then
+        NATIVE_MOD="$CACHE_DIR/natives/hid-$HID_VER+drivelist-$DRIVELIST_VER/node_modules"
+        [ -f "$NATIVE_MOD/node-hid/build/Release/HID_hidraw.node" ] \
+            || die "no cached native builds; re-run from step 7"
+    fi
+    if [ "$FROM_STEP" -gt 8 ]; then
+        DFU_BIN="$CACHE_DIR/debs/dfu-util-x/usr/bin/dfu-util"
+        [ -x "$DFU_BIN" ] || die "no cached dfu-util; re-run from step 8"
+    fi
+    STAGE="$WORK_DIR/staging"; ASARSRC="$STAGE/asar-src"
+    if [ "$FROM_STEP" -gt 9 ]; then
+        PACKED_ASAR="$STAGE/app.asar"
+        [ -f "$PACKED_ASAR" ] || die "no repacked asar; re-run from step 9"
+    fi
+    if [ "$FROM_STEP" -gt 10 ]; then
+        STAGE_ROOT="$STAGE/root"; DEB_VERSION="${UPSTREAM_VER}-${DEB_REV}"
+        [ -d "$STAGE_ROOT/opt/frsky-suite" ] || die "no staged root; re-run from step 10"
+    fi
+    if [ "$FROM_STEP" -gt 11 ]; then
+        OUT_DEB="$OUT_DIR/frsky-suite_${UPSTREAM_VER}-${DEB_REV}_amd64.deb"
+        [ -f "$OUT_DEB" ] || die "no built deb; re-run from step 11"
+    fi
+    export ELECTRON_VER ELECTRON_DIST UPSTREAM_VER HID_VER DRIVELIST_VER \
+           NATIVE_MOD DFU_BIN STAGE ASARSRC PACKED_ASAR STAGE_ROOT DEB_VERSION OUT_DEB
+}
+
+# ------------------------------------------------- system deps (auto-install)
+
+APT_DEPS="binutils python3 gcc g++ make libudev-dev curl xz-utils file desktop-file-utils"
+# Note: dpkg-deb ships in the base 'dpkg' package; node comes as a private
+# tarball (step 5) so no system node is required or modified.
+
+ensure_system_deps() {
+    local missing=""
+    for c in sha256sum dpkg-deb gcc make python3 curl file; do
+        command -v "$c" >/dev/null 2>&1 || missing="$missing$c "
+    done
+    if [ -e /usr/include/libudev.h ] || [ -e /usr/include/systemd/sd-device.h ]; then
+        : # udev headers present
+    else
+        missing="${missing}libudev-dev "
+    fi
+    [ -z "$missing" ] && { log "deps" "system tools present"; return; }
+    log "deps" "installing missing: $missing (sudo apt-get)"
+    command -v apt-get >/dev/null 2>&1 || die "apt-get not found; install $APT_DEPS manually (Debian/Ubuntu/Pop!_OS amd64 required)"
+    command -v sudo >/dev/null 2>&1 || [ "$(id -u)" -eq 0 ] \
+        || die "need sudo or root to install: $missing"
+    as_root apt-get update
+    # shellcheck disable=SC2086
+    as_root apt-get install -y $APT_DEPS
+}
+
+# ------------------------------------------------------------ step 1: fetch
+
+step_1_fetch() {
+    mkdir -p "$WORK_DIR" "$CACHE_DIR" "$OUT_DIR"
+    rm -f "$EXE"
+    case "$INPUT" in
+        http://*|https://*)
+            need_cmd curl "install curl"
+            log "fetch" "downloading $INPUT"
+            curl -fL --retry 3 -o "$EXE" "$INPUT"
+            ;;
+        *)
+            [ -f "$INPUT" ] || die "local file not found: $INPUT"
+            log "fetch" "copying $INPUT"
+            cp -- "$INPUT" "$EXE"
+            ;;
+    esac
+    ( cd "$WORK_DIR" && sha256sum upstream.exe | tee upstream.exe.sha256 )
+    local size; size=$(stat -c%s "$EXE")
+    [ "$size" -gt 10000000 ] || die "input suspiciously small ($size bytes), not a Suite installer?"
+    log "fetch" "input: $size bytes"
+}
+
+# ----------------------------------------------------- step 2: extract-nsis
+
+seven_zz() {
+    # Static 7-Zip in cache; upstream publishes no checksums, so we smoke-test
+    # the binary (version banner) instead of verifying a digest.
+    local zdir="$CACHE_DIR/7zz" zz="$CACHE_DIR/7zz/7zz"
+    if [ ! -x "$zz" ]; then
+        need_cmd curl "install curl"
+        log "7zz" "resolving current static 7-Zip for linux-x64"
+        mkdir -p "$zdir"
+        local page tarball
+        page=$(curl -fsSL --retry 3 "https://www.7-zip.org/download.html") \
+            || die "could not load the 7-Zip download page"
+        tarball=$(echo "$page" | grep -o 'a/7z[0-9]*-linux-x64\.tar\.xz' | sort -uV | tail -1)
+        [ -n "$tarball" ] || die "no linux-x64 tarball link on the 7-Zip download page (layout changed?)"
+        log "7zz" "fetching https://www.7-zip.org/$tarball"
+        curl -fL --retry 3 -o "$zdir/7z.tar.xz.tmp" "https://www.7-zip.org/$tarball" \
+            || die "7-Zip download failed"
+        mv "$zdir/7z.tar.xz.tmp" "$zdir/7z.tar.xz"
+        tar -xJf "$zdir/7z.tar.xz" -C "$zdir"
+        rm -f "$zdir/7z.tar.xz"
+    fi
+    "$zz" 2>&1 | grep -q "7-Zip" || die "cached 7zz failed its smoke test; rm -rf $zdir and retry"
+    echo "$zz"
+}
+
+step_2_extract_nsis() {
+    local zz; zz=$(seven_zz)
+    rm -rf "$NSIS_DIR"; mkdir -p "$NSIS_DIR"
+    "$zz" x -o"$NSIS_DIR" "$EXE" >/dev/null
+    [ -f "$NSIS_DIR/\$PLUGINSDIR/app-64.7z" ] \
+        || die "NSIS payload has no \$PLUGINSDIR/app-64.7z; unsupported installer layout. Contents: $(ls "$NSIS_DIR")"
+    log "extract-nsis" "payload: $(ls "$NSIS_DIR/\$PLUGINSDIR" | tr '\n' ' ')"
+}
+
+# ------------------------------------------------------- step 3: extract-app
+
+step_3_extract_app() {
+    local zz; zz=$(seven_zz)
+    rm -rf "$APP_DIR"; mkdir -p "$APP_DIR"
+    "$zz" x -o"$APP_DIR" "$NSIS_DIR/\$PLUGINSDIR/app-64.7z" >/dev/null
+    [ -f "$APP_DIR/FrSky Suite.exe" ] || [ -f "$APP_DIR/resources/app.asar" ] \
+        || die "app-64.7z did not yield a Suite tree: $(ls "$APP_DIR")"
+    log "extract-app" "$(find "$APP_DIR" -type f | wc -l) files"
+}
+
+# -------------------------------------------------------- step 4: fingerprint
+
+ELECTRON_VER=""
+
+step_4_fingerprint() {
+    file "$EXE" | grep -qi "nullsoft" \
+        && log "fingerprint" "NSIS installer confirmed" \
+        || log "fingerprint" "WARNING: input is not recognised as NSIS ($(file -b "$EXE" | cut -c1-80))"
+    local exe_bin
+    exe_bin=$(ls "$APP_DIR/"*.exe | grep -iv uninstall | head -1)
+    ELECTRON_VER=$(strings "$exe_bin" | grep -o "Electron/[0-9.]*" | head -1 | cut -d/ -f2)
+    [ -n "$ELECTRON_VER" ] || die "could not detect the Electron version in $exe_bin"
+    log "fingerprint" "Electron $ELECTRON_VER"
+    case "$ELECTRON_VER" in
+        17.*) log "fingerprint" "known-good runtime line (ABI stable, Depends line verified)" ;;
+        *) log "fingerprint" "WARNING: Electron $ELECTRON_VER is not the verified 17.x line."
+           log "fingerprint" "WARNING: re-verify the N-API ABI, the Depends line and ALL of docs/how-it-works.md before shipping." ;;
+    esac
+}
+
+# ------------------------------------------------------------- step 5: runtime
+
+NODE_VER=""   # resolved latest LTS, e.g. 22.x
+
+step_5_runtime() {
+    need_cmd curl "install curl"
+    # --- Electron Linux runtime, verified against upstream SHASUMS256.txt ---
+    local edl="$CACHE_DIR/electron-$ELECTRON_VER"
+    if [ ! -x "$edl/electron" ]; then
+        log "runtime" "fetching Electron $ELECTRON_VER (linux-x64)"
+        mkdir -p "$edl"
+        local base="https://github.com/electron/electron/releases/download/v$ELECTRON_VER"
+        curl -fL --retry 3 -o "$edl/SHASUMS256.txt" "$base/SHASUMS256.txt"
+        curl -fL --retry 3 -o "$edl/electron-v$ELECTRON_VER-linux-x64.zip" "$base/electron-v$ELECTRON_VER-linux-x64.zip"
+        ( cd "$edl" && grep "electron-v$ELECTRON_VER-linux-x64.zip" SHASUMS256.txt | sha256sum -c - ) \
+            || die "Electron zip failed SHA256 verification"
+        rm -rf "$edl/dist" && mkdir -p "$edl/dist"
+        python3 -c "import zipfile; zipfile.ZipFile('$edl/electron-v$ELECTRON_VER-linux-x64.zip').extractall('$edl/dist')"
+        chmod +x "$edl/dist/electron"   # zip extraction drops exec bits
+    fi
+    local got; got=$("$edl/dist/electron" --version)
+    [ "$got" = "v$ELECTRON_VER" ] || die "runtime self-report $got != v$ELECTRON_VER"
+    log "runtime" "Electron $got verified"
+    ELECTRON_DIST="$edl/dist"
+    export ELECTRON_DIST
+
+    # --- Private Node toolchain (never touches system node) ---
+    local ndir="$CACHE_DIR/node"
+    if [ ! -x "$ndir/bin/node" ]; then
+        NODE_VER=$(curl -fsSL "https://nodejs.org/dist/index.json" \
+            | python3 -c "import json,sys; lts=[r for r in json.load(sys.stdin) if r.get('lts')]; print(sorted(lts, key=lambda r: tuple(int(x) for x in r['version'].lstrip('v').split('.')))[-1]['version'])")
+        [ -n "$NODE_VER" ] || die "could not resolve the Node LTS version"
+        local major; major=$(echo "$NODE_VER" | cut -d. -f1 | tr -d v)
+        [ "$major" -ge 22 ] || die "latest Node LTS is $NODE_VER (< 22); refusing"
+        log "runtime" "fetching Node $NODE_VER (private toolchain)"
+        mkdir -p "$ndir"
+        curl -fL --retry 3 -o "$ndir/SHASUMS256.txt" "https://nodejs.org/dist/$NODE_VER/SHASUMS256.txt"
+        curl -fL --retry 3 -o "$ndir/node-$NODE_VER-linux-x64.tar.xz" "https://nodejs.org/dist/$NODE_VER/node-$NODE_VER-linux-x64.tar.xz"
+        ( cd "$ndir" && grep "node-$NODE_VER-linux-x64.tar.xz" SHASUMS256.txt | sha256sum -c - ) \
+            || die "Node tarball failed SHA256 verification"
+        tar -xJf "$ndir/node-$NODE_VER-linux-x64.tar.xz" -C "$ndir" --strip-components=1
+        rm -f "$ndir/node-$NODE_VER-linux-x64.tar.xz"
+    fi
+    export PATH="$ndir/bin:$PATH"
+    node --version | grep -q "^v" || die "private node toolchain broken"
+    log "runtime" "node $(node --version) / npm $(npm --version)"
+}
+
+# ---------------------------------------------------------------- step 6: probe
+
+UPSTREAM_VER=""; HID_VER=""; DRIVELIST_VER=""; SERIALPORT_VER=""; USB_VER=""; KOFFI_VER=""
+
+step_6_probe() {
+    export PATH="$CACHE_DIR/node/bin:$PATH"
+    rm -rf "$PROBE_DIR"; mkdir -p "$PROBE_DIR"
+    npx -y @electron/asar extract "$APP_DIR/resources/app.asar" "$PROBE_DIR" >/dev/null 2>&1
+    [ -f "$PROBE_DIR/package.json" ] || die "asar extract produced no package.json"
+    UPSTREAM_VER=$(json_get "$PROBE_DIR/package.json" "d.get('version')")
+    [ -n "$VERSION_OVERRIDE" ] && UPSTREAM_VER="$VERSION_OVERRIDE"
+    log "probe" "upstream version: $UPSTREAM_VER"
+    case "$(basename "$INPUT")" in
+        *"$UPSTREAM_VER"*) : ;;
+        *) log "probe" "WARNING: input filename does not mention $UPSTREAM_VER" ;;
+    esac
+    for m in node-hid drivelist serialport usb koffi; do
+        [ -f "$PROBE_DIR/node_modules/$m/package.json" ] \
+            || die "probe lacks node_modules/$m; unsupported app layout"
+    done
+    HID_VER=$(json_get "$PROBE_DIR/node_modules/node-hid/package.json" "d.get('version')")
+    DRIVELIST_VER=$(json_get "$PROBE_DIR/node_modules/drivelist/package.json" "d.get('version')")
+    SERIALPORT_VER=$(json_get "$PROBE_DIR/node_modules/serialport/package.json" "d.get('version')")
+    USB_VER=$(json_get "$PROBE_DIR/node_modules/usb/package.json" "d.get('version')")
+    KOFFI_VER=$(json_get "$PROBE_DIR/node_modules/koffi/package.json" "d.get('version')")
+    log "probe" "natives: node-hid $HID_VER, drivelist $DRIVELIST_VER, serialport $SERIALPORT_VER, usb $USB_VER, koffi $KOFFI_VER"
+    local ncount; ncount=$(npx -y @electron/asar list "$APP_DIR/resources/app.asar" 2>/dev/null | grep -c '\.node$')
+    log "probe" "in-asar .node files: $ncount"
+    # Anchor pre-checks (hard asserts happen at patch time in step 9).
+    local idx; idx=$(grep -c "indexPath = path.join(__dirname, '../dist/frsky-suite/browser/index.html');" "$PROBE_DIR/app/main.js" || true)
+    [ "$idx" = "1" ] || die "main.js indexPath anchor occurs $idx times (want 1); see docs/new-release.md"
+    grep -q "diskutil " "$PROBE_DIR/app/devices/removable-disks.js" \
+        || die "removable-disks.js has no diskutil fallthrough; drive-lock patch anchor gone, see docs/new-release.md"
+    ls "$PROBE_DIR/app/browser/assets/icons/"*/suite.ico >/dev/null 2>&1 \
+        || find "$PROBE_DIR/app" -name suite.ico | grep -q . \
+        || die "suite.ico not found under probe app tree"
+    export UPSTREAM_VER HID_VER DRIVELIST_VER
+}
+
+# --------------------------------------------------------------- step 7: natives
+
+step_7_natives() {
+    export PATH="$CACHE_DIR/node/bin:$PATH"
+    local nm="$CACHE_DIR/natives/hid-$HID_VER+drivelist-$DRIVELIST_VER/node_modules"
+    if [ -f "$nm/node-hid/build/Release/HID_hidraw.node" ] && [ -f "$nm/drivelist/build/Release/drivelist.node" ]; then
+        log "natives" "cache hit ($HID_VER / $DRIVELIST_VER)"
+    else
+        log "natives" "rebuilding node-hid@$HID_VER + drivelist@$DRIVELIST_VER (needs gcc, libudev headers)"
+        local nb="$CACHE_DIR/natives/hid-$HID_VER+drivelist-$DRIVELIST_VER"
+        rm -rf "$nb"; mkdir -p "$nb"
+        # Hand-written package.json: `npm init -y` derives the package name
+        # from the directory, and our version-keyed dir name is not a valid
+        # npm name (it fails silently under set -e — do not reintroduce).
+        printf '{"name":"frsky-port-natives","version":"1.0.0","private":true}\n' > "$nb/package.json"
+        ( cd "$nb" && npm install --ignore-scripts "node-hid@$HID_VER" "drivelist@$DRIVELIST_VER" )
+        # npm >= 11 gates install scripts: approve, then build.
+        ( cd "$nb" && npm install-scripts approve node-hid drivelist >/dev/null 2>&1 || true )
+        ( cd "$nb" && npm rebuild node-hid drivelist )
+        [ -f "$nm/drivelist/build/Release/drivelist.node" ] \
+            || die "drivelist build produced no .node (see npm output above)"
+        [ -f "$nm/node-hid/build/Release/HID.node" ] \
+            || die "node-hid build produced no HID.node (see npm output above)"
+        [ -f "$nm/node-hid/build/Release/HID_hidraw.node" ] \
+            || die "node-hid build produced no HID_hidraw.node (udev/hidraw backend missing?)"
+    fi
+    # Smoke test with the private node: must enumerate without crashing.
+    node -e "require('$nm/node-hid').devices()" >/dev/null \
+        || die "rebuilt node-hid fails to load"
+    log "natives" "HID.node, HID_hidraw.node, drivelist.node ready + load-tested"
+    NATIVE_MOD="$nm"
+    export NATIVE_MOD
+}
+
+# --------------------------------------------------------------- step 8: dfuutil
+
+DFU_BIN=""
+
+step_8_dfuutil() {
+    local dd="$CACHE_DIR/debs"
+    local dx="$dd/dfu-util-x"
+    if [ ! -x "$dx/usr/bin/dfu-util" ]; then
+        log "dfuutil" "apt-get download dfu-util"
+        mkdir -p "$dd"; rm -rf "$dx"; mkdir -p "$dx"
+        ( cd "$dd" && apt-get download dfu-util ) \
+        || { as_root apt-get update && ( cd "$dd" && apt-get download dfu-util ); } \
+        || die "could not apt-get download dfu-util"
+        dpkg-deb -x "$dd"/dfu-util_*.deb "$dx"
+    fi
+    DFU_BIN="$dx/usr/bin/dfu-util"
+    [ -x "$DFU_BIN" ] || die "dfu-util binary missing after extract"
+    ldd "$DFU_BIN" | grep -q "not found" \
+        && die "dfu-util links libraries not on this system: $(ldd "$DFU_BIN" | grep 'not found')"
+    "$DFU_BIN" -l >/dev/null 2>&1 || true
+    log "dfuutil" "$("$DFU_BIN" --version 2>&1 | head -1)"
+    export DFU_BIN
+}
+
+# ----------------------------------------------------------------- step 9: repack
+
+step_9_repack() {
+    export PATH="$CACHE_DIR/node/bin:$PATH"
+    STAGE="$WORK_DIR/staging"
+    ASARSRC="$STAGE/asar-src"
+    export STAGE ASARSRC
+    rm -rf "$ASARSRC"; mkdir -p "$ASARSRC"
+    cp -a "$PROBE_DIR/package.json" "$PROBE_DIR/app" "$PROBE_DIR/node_modules" "$ASARSRC/"
+    rm -rf "$ASARSRC/thirdparty"   # win64 tools; the Linux set ships unpacked
+    log "repack" "overwriting win32-only in-asar natives with Linux builds"
+    mkdir -p "$ASARSRC/node_modules/drivelist/build/Release" \
+             "$ASARSRC/node_modules/node-hid/build/Release"
+    cp "$NATIVE_MOD/drivelist/build/Release/drivelist.node"   "$ASARSRC/node_modules/drivelist/build/Release/"
+    cp "$NATIVE_MOD/node-hid/build/Release/HID.node"          "$ASARSRC/node_modules/node-hid/build/Release/"
+    cp "$NATIVE_MOD/node-hid/build/Release/HID_hidraw.node"   "$ASARSRC/node_modules/node-hid/build/Release/"
+    find "$ASARSRC" -name "*.node" | sort
+    apply_patches
+    npx -y @electron/asar pack "$ASARSRC" "$STAGE/app.asar" 2>&1 | tail -1
+    ls -lh "$STAGE/app.asar"
+    export PACKED_ASAR="$STAGE/app.asar"
+}
+
+apply_patches() {
+    # Patch 1: Linux indexPath points at a dev-only bundle path; the packaged
+    # file lives next to main.js like on win32.
+    grep -c "dist/frsky-suite/browser" "$ASARSRC/app/main.js" >/dev/null
+    python3 - "$ASARSRC/app/main.js" <<'EOF'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+old = "indexPath = path.join(__dirname, '../dist/frsky-suite/browser/index.html');"
+new = "indexPath = path.join(__dirname, 'browser/index.html');"
+assert s.count(old) == 1, "main.js indexPath anchor not found exactly once"
+open(p, "w").write(s.replace(old, new))
+print("patched main.js linux indexPath")
+EOF
+    # Patch 2: the drive lock/unlock handler implements win32 (koffi) and
+    # darwin (diskutil) only; on Linux it shells a nonexistent macOS command
+    # and reports success with dirty page cache. Flush first: Suite stages
+    # flash images to the mounted disk ~1 s before the HID flash command and
+    # the radio reads them off the shared medium.
+    python3 - "$ASARSRC/app/devices/removable-disks.js" <<'EOF'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+old = """new Promise(function (resolve) {
+                        var cp = require('child_process');"""
+new = """new Promise(function (resolve) {
+                        if (process.platform === 'linux' && (command === 'lock' || command === 'unlock')) {
+                            try {
+                                require('child_process').execFileSync('sync');
+                                console.log("Drive ".concat(command, " ").concat(mount, " - synced"));
+                            }
+                            catch (e) {
+                                console.error("Drive ".concat(command, " ").concat(mount, " - sync failed: "), e);
+                            }
+                            resolve(true);
+                            return;
+                        }
+                        var cp = require('child_process');"""
+assert s.count(old) == 1, "drive-lock patch anchor not found exactly once"
+open(p, "w").write(s.replace(old, new))
+print("patched removable-disks.js linux drive-lock flush")
+EOF
+}
+
+# ----------------------------------------------------------------- step 10: stage
+
+DEFAULT_DEPENDS="libusb-1.0-0, libudev1, libnss3, libatk1.0-0, libatk-bridge2.0-0, libcups2, libdrm2, libxkbcommon0, libxcomposite1, libxdamage1, libxfixes3, libxrandr2, libgbm1, libasound2, libpango-1.0-0, libcairo2, libatspi2.0-0, libgtk-3-0, libx11-6, libxcb1, libxext6, libxi6, libxtst6"
+# Note: Debian 12+/Ubuntu 24.04+ renamed libasound2 -> libasound2t64. If your
+# distro is affected, pass --depends with the corrected line. See docs/.
+
+step_10_stage() {
+    local depends="${DEPENDS_OVERRIDE:-$DEFAULT_DEPENDS}"
+    local deb_version="${UPSTREAM_VER}-${DEB_REV}"
+    local root="$STAGE/root"
+    rm -rf "$root"
+    mkdir -p "$root/opt/frsky-suite/resources" "$root/usr/bin" \
+      "$root/usr/share/applications" "$root/usr/share/icons/hicolor/256x256/apps" \
+      "$root/usr/share/doc/frsky-suite" "$root/lib/udev/rules.d" "$root/DEBIAN"
+    log "stage" "electron runtime"
+    cp -a "$ELECTRON_DIST/." "$root/opt/frsky-suite/"
+    mv "$root/opt/frsky-suite/electron" "$root/opt/frsky-suite/frsky-suite"
+    rm -rf "$root/opt/frsky-suite/resources"   # dist stub, replaced below
+    mkdir -p "$root/opt/frsky-suite/resources"
+    log "stage" "repacked app.asar"
+    cp "$PACKED_ASAR" "$root/opt/frsky-suite/resources/app.asar"
+    log "stage" "app.asar.unpacked (linux natives + thirdparty)"
+    local u="$root/opt/frsky-suite/resources/app.asar.unpacked"
+    mkdir -p "$u/node_modules/node-hid/build/Release" "$u/node_modules/drivelist/build/Release" \
+      "$u/thirdparty/dfu-util/linux" "$u/thirdparty/aegis/linux"
+    cp "$NATIVE_MOD/node-hid/build/Release/HID_hidraw.node" "$u/node_modules/node-hid/build/Release/"
+    cp "$NATIVE_MOD/node-hid/build/Release/HID.node"        "$u/node_modules/node-hid/build/Release/"
+    cp "$NATIVE_MOD/drivelist/build/Release/drivelist.node" "$u/node_modules/drivelist/build/Release/"
+    cp -a "$APP_DIR/resources/app.asar.unpacked/node_modules/usb"         "$u/node_modules/"
+    cp -a "$APP_DIR/resources/app.asar.unpacked/node_modules/@serialport" "$u/node_modules/"
+    mkdir -p "$u/node_modules/koffi/build/koffi"
+    cp -a "$APP_DIR/resources/app.asar.unpacked/node_modules/koffi/build/koffi/linux_x64" "$u/node_modules/koffi/build/koffi/"
+    cp -a "$APP_DIR/resources/app.asar.unpacked/node_modules/koffi/package.json"          "$u/node_modules/koffi/" 2>/dev/null || true
+    cp "$DFU_BIN" "$u/thirdparty/dfu-util/linux/dfu-util"
+    chmod 755 "$u/thirdparty/dfu-util/linux/dfu-util"
+    cat > "$u/thirdparty/aegis/linux/README.txt" <<'EOF'
+FrSky Suite Linux port: the upstream Windows installer ships only
+thirdparty/aegis/win64/aegis_updater.exe, and no Linux aegis-updater exists
+in the package. Aegis flashing reports "unsupportedPlatform" until FrSky
+publishes a Linux build; place it here as: thirdparty/aegis/linux/aegis-updater
+DFU (dfu-util), HID (node-hid), serial (serialport) and SD-card (drivelist)
+flows do not depend on aegis.
+EOF
+    log "stage" "icon (largest PNG carved from suite.ico)"
+    local ico; ico=$(find "$PROBE_DIR/app" -name suite.ico | head -1)
+    [ -n "$ico" ] || die "suite.ico not found under probe app tree"
+    python3 - "$ico" "$root/usr/share/icons/hicolor/256x256/apps/frsky-suite.png" <<'EOF'
+import struct, sys
+ico, out = sys.argv[1], sys.argv[2]
+d = open(ico, "rb").read()
+n = struct.unpack("<H", d[4:6])[0]
+best = None
+for i in range(n):
+    w, h, _, _, _, _, sz, off = struct.unpack("<BBBBHHII", d[6+16*i:6+16*(i+1)])
+    w = w or 256; h = h or 256
+    blob = d[off:off+sz]
+    if blob[:8] == b"\x89PNG\r\n\x1a\n" and (best is None or w*h > best[0]):
+        best = (w*h, blob)
+assert best, "no PNG in ico"
+open(out, "wb").write(best[1])
+print("icon %d bytes" % len(best[1]))
+EOF
+    log "stage" "desktop file, symlink, udev, docs"
+    cat > "$root/usr/share/applications/frsky-suite.desktop" <<'EOF'
+[Desktop Entry]
+Name=FrSky Suite
+Comment=FrSky radio toolkit (DFU, HID, serial, SD-card)
+Exec=/opt/frsky-suite/frsky-suite --no-sandbox %U
+Icon=frsky-suite
+Terminal=false
+Type=Application
+Categories=Utility;Electronics;
+StartupWMClass=FrSky Suite
+EOF
+    # --no-sandbox: the bundled Electron 17 setuid sandbox SIGTRAPs on current
+    # kernels despite correct 4755 chrome-sandbox perms; postinst still sets
+    # 4755 so dropping the flag re-enables the sandbox.
+    ln -sf /opt/frsky-suite/frsky-suite "$root/usr/bin/frsky-suite"
+    cat > "$root/lib/udev/rules.d/99-frsky-suite.rules" <<'EOF'
+# FrSky Suite - radio USB access (STM32 DFU 0483:df11, FrSky HID/serial).
+# Primary mechanism on Debian is TAG+="uaccess" (systemd); GROUP lines are fallback.
+SUBSYSTEM=="usb", ATTR{idVendor}=="0483", ATTR{idProduct}=="df11", MODE="0664", GROUP="plugdev", TAG+="uaccess"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0483", MODE="0664", GROUP="plugdev", TAG+="uaccess"
+SUBSYSTEM=="tty", ATTRS{idVendor}=="0483", MODE="0664", GROUP="dialout", TAG+="uaccess"
+# If your radio enumerates with a different VID (check lsusb), add a matching line.
+EOF
+    cat > "$root/usr/share/doc/frsky-suite/README.Debian" <<EOF
+FrSky Suite for Debian (community Linux port)
+=============================================
+
+Repack of FrSky Suite $UPSTREAM_VER (FrSky RC) for Debian amd64.
+
+What works:
+- DFU detection/flashing: node-usb + bundled thirdparty/dfu-util/linux/dfu-util
+  (STM32 VID 0483 PID df11). Windows UsbDk/WinUSB flow is not used on Linux;
+  udev rules (99-frsky-suite.rules) replace it.
+- HID radio link: node-hid rebuilt for Linux (hidraw).
+- Serial console: serialport with shipped Linux prebuilds.
+- SD-card tools: drivelist rebuilt for Linux.
+
+Known upstream limitations (same as macOS/Linux gating in shipped code):
+- Aegis updater: no Linux binary shipped by FrSky; flashing via Aegis
+  reports "unsupportedPlatform".
+- Audio transcode (ffmpeg): upstream disables it on Linux
+  ("PlatformNotSupported"); install ffmpeg anyway (Recommends) for future use.
+
+Post-install:
+  sudo usermod -aG plugdev,dialout \$USER   # then log out/in (or reboot)
+  reconnect the radio
+
+Verify:
+  lsusb -d 0483:df11                  # DFU mode
+  ls /dev/hidraw*                     # HID radio
+  ls /dev/ttyACM* /dev/ttyUSB*        # serial
+EOF
+    cat > "$root/usr/share/doc/frsky-suite/changelog" <<EOF
+frsky-suite ($deb_version) unstable; urgency=medium
+
+  * Community Debian port of FrSky Suite $UPSTREAM_VER (converted with frsky-port).
+
+ -- frsky-port $(date -u +%Y-%m-%d)
+EOF
+    log "stage" "DEBIAN control + scripts"
+    cat > "$root/DEBIAN/control" <<EOF
+Package: frsky-suite
+Version: $deb_version
+Section: electronics
+Priority: optional
+Architecture: amd64
+Depends: $depends
+Recommends: ffmpeg
+Maintainer: FrSky RC <kanglai.fu@frsky-rc.com>
+Homepage: https://frsky-rc.com
+Description: FrSky Suite radio toolkit (community Linux port)
+ Reverse-engineered repack of FrSky Suite $UPSTREAM_VER for Debian amd64:
+ Electron runtime, DFU flashing via dfu-util (STM32 0483:df11),
+ HID radio link, serial console and SD-card tools with udev rules.
+ Aegis updater and audio transcode remain unsupported on Linux,
+ matching upstream platform gating.
+EOF
+    cat > "$root/DEBIAN/postinst" <<'EOF'
+#!/bin/sh
+set -e
+chmod 4755 /opt/frsky-suite/chrome-sandbox || true
+udevadm control --reload-rules || true
+udevadm trigger --subsystem-match=usb --action=change || true
+update-desktop-database /usr/share/applications || true
+echo "FrSky Suite installed. Log out/in (uaccess) or add your user to plugdev/dialout, then reconnect the radio."
+EOF
+    cat > "$root/DEBIAN/prerm" <<'EOF'
+#!/bin/sh
+set -e
+rm -f /usr/bin/frsky-suite
+EOF
+    chmod 755 "$root/DEBIAN/postinst" "$root/DEBIAN/prerm"
+    export STAGE_ROOT="$root" DEB_VERSION="$deb_version"
+}
+
+# -------------------------------------------------------------------- step 11: deb
+
+OUT_DEB=""
+
+step_11_deb() {
+    mkdir -p "$OUT_DIR"
+    OUT_DEB="$OUT_DIR/frsky-suite_${DEB_VERSION}_amd64.deb"
+    rm -f "$OUT_DEB"
+    dpkg-deb --root-owner-group -b "$STAGE_ROOT" "$OUT_DEB"
+    ls -lh "$OUT_DEB"
+    export OUT_DEB
+}
+
+# ----------------------------------------------------------------- step 12: verify
+
+step_12_verify() {
+    export PATH="$CACHE_DIR/node/bin:$PATH"
+    local vtmp="$WORK_DIR/tmp-verify"
+    rm -rf "$vtmp"; mkdir -p "$vtmp"
+    # 12a. Packed asar: the six loader-critical paths must be Linux ELFs.
+    npx -y @electron/asar extract "$STAGE_ROOT/opt/frsky-suite/resources/app.asar" "$vtmp/asar" >/dev/null 2>&1
+    local f fail=0
+    for f in node_modules/drivelist/build/Release/drivelist.node \
+             node_modules/node-hid/build/Release/HID.node \
+             node_modules/node-hid/build/Release/HID_hidraw.node \
+             node_modules/@serialport/bindings-cpp/prebuilds/linux-x64/node.napi.glibc.node \
+             node_modules/usb/prebuilds/linux-x64/node.napi.glibc.node \
+             node_modules/koffi/build/koffi/linux_x64/koffi.node; do
+        if file "$vtmp/asar/$f" | grep -q "ELF 64-bit LSB shared object, x86-64"; then
+            log "verify" "ELF ok: $f"
+        else
+            log "verify" "NOT an x86-64 ELF: $f"; fail=1
+        fi
+    done
+    grep -q "path.join(__dirname, 'browser/index.html');" "$vtmp/asar/app/main.js" \
+        || { log "verify" "main.js indexPath patch missing"; fail=1; }
+    grep -q "execFileSync('sync')" "$vtmp/asar/app/devices/removable-disks.js" \
+        || { log "verify" "drive-lock flush patch missing"; fail=1; }
+    [ "$fail" = "0" ] || die "asar verification failed"
+    # 12b. N-API load test with the real Electron runtime (proves ABI match).
+    ELECTRON_RUN_AS_NODE=1 "$ELECTRON_DIST/electron" -e "
+const base='$vtmp/asar/node_modules';
+for (const m of ['usb','node-hid','serialport','drivelist','koffi']) require(base+'/'+m);
+console.log('native load test passed');
+" || die "native load test failed (N-API/ABI mismatch?)"
+    # 12c. Packaging lint.
+    if command -v desktop-file-validate >/dev/null 2>&1; then
+        dpkg-deb -x "$OUT_DEB" "$vtmp/deb"
+        dpkg-deb -e "$OUT_DEB" "$vtmp/deb/DEBIAN"
+        desktop-file-validate "$vtmp/deb/usr/share/applications/frsky-suite.desktop" \
+            || die "desktop-file-validate failed"
+        sh -n "$vtmp/deb/DEBIAN/postinst" && sh -n "$vtmp/deb/DEBIAN/prerm" \
+            || die "maintainer script syntax check failed"
+        # NOTE: never pipe dpkg-deb -c into `grep -q` here: grep's early exit
+        # SIGPIPEs the writer and pipefail turns that into a false failure.
+        dpkg-deb -c "$OUT_DEB" > "$vtmp/contents.txt"
+        for k in app.asar dfu-util frsky-suite.desktop 99-frsky-suite.rules; do
+            grep -q "$k" "$vtmp/contents.txt" || die "deb contents lack $k"
+        done
+        [ -L "$vtmp/deb/usr/bin/frsky-suite" ] || die "/usr/bin symlink missing"
+    else
+        log "verify" "WARNING: desktop-file-validate not installed, skipping lint"
+    fi
+    rm -rf "$vtmp"
+    log "verify" "all checks passed"
+}
+
+# ---------------------------------------------------------------- step 13: install
+
+step_13_install() {
+    case "$INSTALL_MODE" in
+        no) log "install" "skipped (--no-install). Deb: $OUT_DEB"; return ;;
+        prompt)
+            printf 'Install %s now? [Y/n] ' "$OUT_DEB"
+            read -r ans
+            case "$ans" in [nN]*) log "install" "declined. Deb: $OUT_DEB"; return ;; esac
+            ;;
+    esac
+    command -v sudo >/dev/null 2>&1 || [ "$(id -u)" -eq 0 ] \
+        || die "need sudo or root to install"
+    as_root dpkg -i "$OUT_DEB"
+    log "install" "done. Log out/in (or reboot) for the udev/USB permissions, then reconnect the radio."
+}
+
+# ---------------------------------------------------------------------- main
+
+ensure_system_deps
+resume_state
+run_step 1 fetch
+run_step 2 extract-nsis
+run_step 3 extract-app
+run_step 4 fingerprint
+run_step 5 runtime
+run_step 6 probe
+run_step 7 natives
+run_step 8 dfuutil
+run_step 9 repack
+run_step 10 stage
+run_step 11 deb
+run_step 12 verify
+run_step 13 install
+log "done" "$OUT_DEB"
