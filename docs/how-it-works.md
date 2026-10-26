@@ -74,3 +74,9 @@ x86-64 ELFs).
   4755 so removing the flag re-enables the sandbox.
 - udev rules grant `uaccess` (systemd) with `plugdev`/`dialout` fallback.
   Sessions predate group changes — **reboot** after `usermod`, then replug.
+- **Linux does not mount the radio for you.** Suite enumerates only mounted
+  volumes; the non-Windows mount/unmount handler is the macOS `diskutil`
+  stub, so an unmounted RADIO/SD partition is invisible to backup, restore
+  and flash staging. Most desktops auto-mount; where they do not (seen on
+  Pop!_OS 24), `udisksctl mount -b /dev/sdX1` first. `lsblk` must show a
+  `MOUNTPOINT` for the partition, otherwise the backup lists are empty.
