@@ -602,7 +602,7 @@ EOF
 
 # ----------------------------------------------------------------- step 10: stage
 
-DEFAULT_DEPENDS="libusb-1.0-0, libudev1, libnss3, libatk1.0-0, libatk-bridge2.0-0, libcups2, libdrm2, libxkbcommon0, libxcomposite1, libxdamage1, libxfixes3, libxrandr2, libgbm1, libasound2, libpango-1.0-0, libcairo2, libatspi2.0-0, libgtk-3-0, libx11-6, libxcb1, libxext6, libxi6, libxtst6"
+DEFAULT_DEPENDS="libusb-1.0-0, libudev1, libnss3, libatk1.0-0, libatk-bridge2.0-0, libcups2, libdrm2, libxkbcommon0, libxcomposite1, libxdamage1, libxfixes3, libxrandr2, libgbm1, libasound2, libpango-1.0-0, libcairo2, libatspi2.0-0, libgtk-3-0, libx11-6, libxcb1, libxext6, libxi6, libxtst6, udisks2"
 # Note: Debian 12+/Ubuntu 24.04+ renamed libasound2 -> libasound2t64. If your
 # distro is affected, pass --depends with the corrected line. See docs/.
 
