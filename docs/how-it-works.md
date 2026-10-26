@@ -73,7 +73,9 @@ x86-64 ELFs).
    the SD card, leaves ordinary USB storage alone, and retries a failed
    mount after a 60 s backoff. Without it, a desktop that does not
    auto-mount (seen on Pop!_OS 24) shows an empty backup page and cannot
-   stage a flash image.
+   stage a flash image. Field-verified on Pop!_OS 24: with `/dev/sdb1`
+   unmounted, the build logged `Auto-mounted /dev/sdb1 (RADIO)` and both
+   backup lists populated without a manual mount.
 
 ## Runtime notes
 
@@ -88,7 +90,8 @@ x86-64 ELFs).
 - **Linux mounting.** Suite enumerates only mounted volumes; the upstream
   non-Windows mount/unmount handler is the macOS `diskutil` stub. Patch 3
   auto-mounts FrSky USB partitions with `udisksctl`, so current builds work
-  on desktops that do not auto-mount (seen on Pop!_OS 24). It depends on
-  `udisks2` being present and authorized for the session; if it is not, or
-  an SD card has neither a FrSky USB parent nor an EthOS label, mount it
-  manually with `udisksctl mount -b /dev/sdX1` and re-enter the page.
+  on desktops that do not auto-mount (field-verified on Pop!_OS 24). It
+  depends on `udisks2` being present and authorized for the session; if it
+  is not, or an SD card has neither a FrSky USB parent nor an EthOS label,
+  mount it manually with `udisksctl mount -b /dev/sdX1` and re-enter the
+  page.
