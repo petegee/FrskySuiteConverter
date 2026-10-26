@@ -4,12 +4,13 @@
 #   1. workflow_dispatch input `upstream_tag` (manual: rebuild anything,
 #      including RCs).
 #   2. Daily schedule: the newest *stable* `suite*` tag on
-#      FrSkyRC/ETHOS-Feedback-Community with no converted release here.
+#      FrSkyRC/ETHOS-Feedback-Community with no converted release here in
+#      any deb revision.
 #
 # Tag scheme for OUR releases:  suite-<upstream>-<deb-rev>  (e.g. suite-2.0.1-1)
 # Automatic runs skip prereleases and rc/nightly/alpha/beta tags; a manual
-# dispatch can target any tag (deliberate human action). DEB_REV bumps for
-# re-issues of the same upstream stay manual via the `deb_rev` input.
+# dispatch can target any tag (deliberate human action). Reissues of the same
+# upstream (DEB_REV bumps) stay manual via the `deb_rev` input.
 #
 # The downloaded .exe is checked against the sha256 digest GitHub records on
 # the upstream asset before the converter runs (see --expect-sha256).
@@ -79,10 +80,25 @@ jobs:
           VER=$(echo "$TAG" | sed -E 's/^[^0-9]*//')
           [ -n "$VER" ] || { echo "cannot parse a version out of tag $TAG" >&2; exit 1; }
           OUR_TAG="suite-$VER-$DEB_REV"
-          if gh release view "$OUR_TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
-            echo "do_build=false" >> "$GITHUB_OUTPUT"
-            echo "$OUR_TAG already converted; nothing to do"
-            exit 0
+          if [ -n "${MANUAL_TAG:-}" ]; then
+            # Manual dispatch: skip only the exact requested revision, so a
+            # human can deliberately reissue a lower/new revision.
+            if gh release view "$OUR_TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+              echo "do_build=false" >> "$GITHUB_OUTPUT"
+              echo "$OUR_TAG already converted; nothing to do"
+              exit 0
+            fi
+          else
+            # Automatic: any existing revision means this upstream version is
+            # already converted. Without this, a manual rev bump (2.0.1-3)
+            # would be shadowed by a later automatic 2.0.1-1 build.
+            if gh release list --repo "${{ github.repository }}" --limit 1000 \
+                 --json tagName --jq '.[].tagName' \
+               | grep -Eq "^suite-${VER//./\\.}-[0-9]+$"; then
+              echo "do_build=false" >> "$GITHUB_OUTPUT"
+              echo "suite-$VER already converted; nothing to do"
+              exit 0
+            fi
           fi
           ASSET=$(gh release view "$TAG" --repo "$UPSTREAM_REPO" --json assets \
             --jq '.assets[] | select(.name | test("Windows.*\\.exe$"; "i"))
