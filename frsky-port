@@ -556,7 +556,7 @@ function linuxRadioDisksToMount() {
                         return;
                     }
                     var label = String(part.label || '');
-                    if (!isFrsky && !/^(RADIO|FLASH|ETHOS|SDCARD?)$/i.test(label)) {
+                    if (!isFrsky && !/^(RADIO|FLASH|ETHOS|SD|SDCARD)$/i.test(label)) {
                         return;
                     }
                     var name = String(part.name || '');
