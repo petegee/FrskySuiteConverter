@@ -377,6 +377,10 @@ step_6_probe() {
     [ "$idx" = "1" ] || die "main.js indexPath anchor occurs $idx times (want 1); see docs/new-release.md"
     grep -q "diskutil " "$PROBE_DIR/app/devices/removable-disks.js" \
         || die "removable-disks.js has no diskutil fallthrough; drive-lock patch anchor gone, see docs/new-release.md"
+    local upd; upd=$(grep -Fc "function updateRemovableDisks(ctx) {" "$PROBE_DIR/app/devices/removable-disks.js" || true)
+    [ "$upd" = "1" ] || die "removable-disks.js updateRemovableDisks anchor occurs $upd times (want 1); auto-mount patch anchor gone, see docs/new-release.md"
+    local dll; dll=$(grep -Fc "        dl.list().then(function (drives) {" "$PROBE_DIR/app/devices/removable-disks.js" || true)
+    [ "$dll" = "1" ] || die "removable-disks.js dl.list anchor occurs $dll times (want 1); auto-mount patch anchor gone, see docs/new-release.md"
     ls "$PROBE_DIR/app/browser/assets/icons/"*/suite.ico >/dev/null 2>&1 \
         || find "$PROBE_DIR/app" -name suite.ico | grep -q . \
         || die "suite.ico not found under probe app tree"
@@ -505,6 +509,94 @@ new = """new Promise(function (resolve) {
 assert s.count(old) == 1, "drive-lock patch anchor not found exactly once"
 open(p, "w").write(s.replace(old, new))
 print("patched removable-disks.js linux drive-lock flush")
+EOF
+    # Patch 3: Linux Suite only enumerates *mounted* volumes; its non-win32
+    # mount/unmount handler is the macOS diskutil stub, so a radio (or its SD
+    # card) that the desktop did not auto-mount is invisible to backup,
+    # restore and flash staging. Before each drive scan, mount unmounted
+    # partitions of FrSky USB devices with udisksctl. Scoped to USB parents
+    # whose vendor/model says FrSky (all partitions, so SD is covered) or
+    # whose partition label is an EthOS label, so ordinary USB storage is
+    # left alone.
+    python3 - "$ASARSRC/app/devices/removable-disks.js" <<'EOF'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+helper = '''var linuxMountInflight = {};
+var linuxMountFailedAt = {};
+function linuxRadioDisksToMount() {
+    if (process.platform !== 'linux') {
+        return Promise.resolve();
+    }
+    var cp = require('child_process');
+    return new Promise(function (resolve) {
+        cp.execFile('lsblk', ['--json', '--output', 'NAME,LABEL,FSTYPE,MOUNTPOINT,RM,TRAN,TYPE,VENDOR,MODEL'], { timeout: 5000 }, function (error, stdout) {
+            if (error || !stdout) {
+                resolve();
+                return;
+            }
+            var devices;
+            try {
+                devices = JSON.parse(stdout).blockdevices || [];
+            }
+            catch (e) {
+                resolve();
+                return;
+            }
+            var pending = [];
+            var now = Date.now();
+            devices.forEach(function (disk) {
+                if (String(disk.tran || '').toLowerCase() !== 'usb') {
+                    return;
+                }
+                var isFrsky = /frsky/i.test([disk.vendor, disk.model].filter(Boolean).join(' '));
+                var partitions = disk.children && disk.children.length ? disk.children : [disk];
+                partitions.forEach(function (part) {
+                    if (!part || !part.fstype || part.mountpoint || part.fstype === 'swap') {
+                        return;
+                    }
+                    var label = String(part.label || '');
+                    if (!isFrsky && !/^(RADIO|FLASH|ETHOS|SDCARD?)$/i.test(label)) {
+                        return;
+                    }
+                    var name = String(part.name || '');
+                    if (!name) {
+                        return;
+                    }
+                    var dev = name.charAt(0) === '/' ? name : '/dev/' + name;
+                    if (linuxMountInflight[dev] || (linuxMountFailedAt[dev] && now - linuxMountFailedAt[dev] < 60000)) {
+                        return;
+                    }
+                    linuxMountInflight[dev] = true;
+                    pending.push(new Promise(function (done) {
+                        cp.execFile('udisksctl', ['mount', '-b', dev], { timeout: 15000 }, function (mountError, mountStdout, mountStderr) {
+                            delete linuxMountInflight[dev];
+                            if (mountError) {
+                                linuxMountFailedAt[dev] = Date.now();
+                                console.error('Auto-mount ' + dev + ' failed: ' + String(mountStderr || mountError.message || mountError).trim());
+                            }
+                            else {
+                                delete linuxMountFailedAt[dev];
+                                console.log('Auto-mounted ' + dev + ' (' + (label || 'FrSky') + '): ' + String(mountStdout || '').trim());
+                            }
+                            done();
+                        });
+                    }));
+                });
+            });
+            Promise.all(pending).then(resolve, resolve);
+        });
+    });
+}
+'''
+anchor = "function updateRemovableDisks(ctx) {"
+assert s.count(anchor) == 1, "removable-disks update anchor not found exactly once"
+s = s.replace(anchor, helper + anchor)
+old = "        dl.list().then(function (drives) {"
+new = "        linuxRadioDisksToMount().then(function () { return dl.list(); }).then(function (drives) {"
+assert s.count(old) == 1, "removable-disks dl.list anchor not found exactly once"
+open(p, "w").write(s.replace(old, new))
+print("patched removable-disks.js linux auto-mount")
 EOF
 }
 
@@ -704,6 +796,11 @@ step_12_verify() {
         || { log "verify" "main.js indexPath patch missing"; fail=1; }
     grep -q "execFileSync('sync')" "$vtmp/asar/app/devices/removable-disks.js" \
         || { log "verify" "drive-lock flush patch missing"; fail=1; }
+    grep -q "linuxRadioDisksToMount" "$vtmp/asar/app/devices/removable-disks.js" \
+        || { log "verify" "linux auto-mount patch missing"; fail=1; }
+    ELECTRON_RUN_AS_NODE=1 "$ELECTRON_DIST/electron" \
+        --check "$vtmp/asar/app/devices/removable-disks.js" \
+        || { log "verify" "patched removable-disks.js does not parse"; fail=1; }
     [ "$fail" = "0" ] || die "asar verification failed"
     # 12b. N-API load test with the real Electron runtime (proves ABI match).
     ELECTRON_RUN_AS_NODE=1 "$ELECTRON_DIST/electron" -e "

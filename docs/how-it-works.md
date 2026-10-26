@@ -48,7 +48,7 @@ Corollary: the asar's `.node` inventory stays identical to upstream except
 the two overwrites + one addition (step 12 verifies all six paths are
 x86-64 ELFs).
 
-## The two Linux patches (applied in step 9, anchors asserted exactly-once)
+## The three Linux patches (applied in step 9, anchors asserted exactly-once)
 
 1. **`app/main.js` — Linux `indexPath`.** The Linux branch points at the
    dev-only `../dist/frsky-suite/browser/index.html`; the packaged file is
@@ -63,6 +63,17 @@ x86-64 ELFs).
    (`hid.flash.frsk.done status:255`). Field-verified: X18RS bootloader
    flash failed with `status:255` on the unflushed build and succeeded
    with this flush.
+3. **`app/devices/removable-disks.js` — Linux auto-mount.** The same
+   non-Windows handler is the macOS `diskutil` stub, so Suite never mounts
+   anything itself; its drive scan only sees volumes the desktop already
+   mounted. Before each scan the port now runs `lsblk --json` and, when a
+   USB device's vendor/model contains `FrSky` (or a partition has an EthOS
+   label: `RADIO`, `FLASH`, `ETHOS`, `SD`/`SDCARD`), mounts every unmounted
+   partition with `udisksctl mount -b`. That covers the internal drive and
+   the SD card, leaves ordinary USB storage alone, and retries a failed
+   mount after a 60 s backoff. Without it, a desktop that does not
+   auto-mount (seen on Pop!_OS 24) shows an empty backup page and cannot
+   stage a flash image.
 
 ## Runtime notes
 
@@ -74,9 +85,10 @@ x86-64 ELFs).
   4755 so removing the flag re-enables the sandbox.
 - udev rules grant `uaccess` (systemd) with `plugdev`/`dialout` fallback.
   Sessions predate group changes — **reboot** after `usermod`, then replug.
-- **Linux does not mount the radio for you.** Suite enumerates only mounted
-  volumes; the non-Windows mount/unmount handler is the macOS `diskutil`
-  stub, so an unmounted RADIO/SD partition is invisible to backup, restore
-  and flash staging. Most desktops auto-mount; where they do not (seen on
-  Pop!_OS 24), `udisksctl mount -b /dev/sdX1` first. `lsblk` must show a
-  `MOUNTPOINT` for the partition, otherwise the backup lists are empty.
+- **Linux mounting.** Suite enumerates only mounted volumes; the upstream
+  non-Windows mount/unmount handler is the macOS `diskutil` stub. Patch 3
+  auto-mounts FrSky USB partitions with `udisksctl`, so current builds work
+  on desktops that do not auto-mount (seen on Pop!_OS 24). It depends on
+  `udisks2` being present and authorized for the session; if it is not, or
+  an SD card has neither a FrSky USB parent nor an EthOS label, mount it
+  manually with `udisksctl mount -b /dev/sdX1` and re-enter the page.

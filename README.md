@@ -37,7 +37,7 @@ Then reconnect the radio. If a step misbehaves, start with
 | 6 | probe | Extract pristine `app.asar`; read versions, native-module inventory, patch anchors (fail-fast on upstream drift) |
 | 7 | natives | Rebuild `node-hid` + `drivelist` for Linux, pinned to the app's versions, cached in `~/.cache/frsky-port` |
 | 8 | dfuutil | `apt-get download dfu-util`, extract the binary (upstream ships Windows-only) |
-| 9 | repack | Drop win64 dead weight, inject the 3 Linux `.node` files, apply the 2 Linux patches, repack `app.asar` |
+| 9 | repack | Drop win64 dead weight, inject the 3 Linux `.node` files, apply the 3 Linux patches, repack `app.asar` |
 | 10 | stage | Electron runtime, unpacked natives, dfu-util, icon, desktop file, udev rules, docs, `DEBIAN/` |
 | 11 | deb | `dpkg-deb --build` → `out/frsky-suite_<ver>-<rev>_amd64.deb` |
 | 12 | verify | Fail-closed checks: in-asar ELFs, N-API load test, desktop/maintainer-script lint, contents |
@@ -125,7 +125,7 @@ involvement:
 ## Docs
 
 - [`docs/how-it-works.md`](docs/how-it-works.md) — USB architecture, the
-  native-module loader rules, and what the two Linux patches do and why.
+  native-module loader rules, and what the three Linux patches do and why.
 - [`docs/new-release.md`](docs/new-release.md) — step-by-step checklist for
   porting the next Suite release.
 - [`docs/troubleshooting.md`](docs/troubleshooting.md) — symptom → cause →

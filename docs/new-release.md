@@ -17,18 +17,20 @@ read the warnings — they exist for the cases automation can't judge.
    prebuilds still ship in-asar (step 6 logs the `.node` inventory count;
    investigate any drop).
 4. **Patch anchors.** Steps 6 and 9 assert the `main.js` indexPath anchor
-   (exactly once) and the `removable-disks.js` diskutil fallthrough. If an
-   assert fires, upstream refactored: locate the new equivalent, update
-   `apply_patches()` in `frsky-port`, document it in
+   (exactly once), the `removable-disks.js` diskutil fallthrough, and the
+   `updateRemovableDisks` / `dl.list()` anchors used by the auto-mount
+   patch. If an assert fires, upstream refactored: locate the new
+   equivalent, update `apply_patches()` in `frsky-port`, document it in
    [`how-it-works.md`](how-it-works.md).
 5. **Renderer expectations.** Spot-check the new package for `dfu-util/<plat>`
    and `aegis/<plat>` platform branches and `thirdparty/` contents
    (work/ trees are kept for inspection). No Linux aegis binary yet →
    placeholder stays.
 6. **Full run + verify.** `./frsky-port <new-exe>` end to end; step 12 must
-   pass clean. Then a real-radio smoke test: HID link, MSC disks, DFU detect
-   (`dfu-util -l`), and one flash flow with the debug log on. If a flash
-   NAKs with `status:255`, follow the staged-image triage in
+   pass clean. Then a real-radio smoke test: HID link, MSC disks (including
+   a desktop that does *not* auto-mount, so the auto-mount patch runs), DFU
+   detect (`dfu-util -l`), and one flash flow with the debug log on. If a
+   flash NAKs with `status:255`, follow the staged-image triage in
    [`troubleshooting.md`](troubleshooting.md) before assuming a port bug.
 7. **Ship.** Bump `--deb-rev`, keep the previous `out/*.deb` files for
    rollback, note the upstream delta in your release notes.
